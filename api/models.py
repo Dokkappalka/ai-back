@@ -348,9 +348,106 @@ class MusicGeneration(models.Model):
         return f"Music Generation #{self.id} - {user_str} - {self.status}"
 
 
+class AIModel(models.Model):
+    """
+    Model for managing which AI models are available in the frontend.
+    Administrators can enable/disable specific OpenRouter models here.
+    """
+    model_id = models.CharField(
+        max_length=150,
+        unique=True,
+        help_text="Exact Model ID from OpenRouter (e.g., 'openai/gpt-4o-mini')"
+    )
+    name = models.CharField(
+        max_length=150,
+        blank=True,
+        help_text="Custom name to display. Leave blank to use OpenRouter's default name"
+    )
+    is_active = models.BooleanField(
+        default=True,
+        help_text="Whether this model is available for users to select"
+    )
+    is_default = models.BooleanField(
+        default=False,
+        help_text="Whether this model is selected by default for new chats"
+    )
+    order = models.IntegerField(
+        default=0,
+        help_text="Display order in the frontend (lower means higher up)"
+    )
+
+    def save(self, *args, **kwargs):
+        if self.is_default:
+            # Set all other models to not default
+            AIModel.objects.exclude(pk=self.pk).update(is_default=False)
+        super().save(*args, **kwargs)
+
+    class Meta:
+        ordering = ['order', 'model_id']
+        verbose_name = 'AI Model'
+        verbose_name_plural = 'AI Models'
+
+    def __str__(self):
+        return f"{self.name or self.model_id} ({'Active' if self.is_active else 'Inactive'})"
+
+
+class Conversation(models.Model):
+    """
+    Model for chat conversations (sessions).
+    Each conversation groups multiple messages together.
+    """
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='conversations',
+        help_text="User who owns this conversation"
+    )
+    title = models.CharField(
+        max_length=255,
+        default='New Chat',
+        help_text="Title of the conversation"
+    )
+    model = models.CharField(
+        max_length=100,
+        default='openai/gpt-4o-mini',
+        help_text="OpenRouter model ID used in this conversation"
+    )
+    system_prompt = models.TextField(
+        blank=True,
+        null=True,
+        help_text="System prompt for this conversation"
+    )
+    temperature = models.FloatField(
+        default=0.7,
+        help_text="Sampling temperature (0.0 - 2.0)"
+    )
+    max_tokens = models.IntegerField(
+        default=4096,
+        help_text="Maximum tokens in response"
+    )
+    is_archived = models.BooleanField(
+        default=False,
+        help_text="Whether this conversation is archived"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-updated_at']
+        verbose_name = 'Conversation'
+        verbose_name_plural = 'Conversations'
+        indexes = [
+            models.Index(fields=['user', '-updated_at']),
+            models.Index(fields=['user', 'is_archived']),
+        ]
+
+    def __str__(self):
+        return f"Conversation #{self.id} - {self.title}"
+
+
 class ChatMessage(models.Model):
     """
-    Model for chat messages.
+    Model for chat messages within a conversation.
     """
     ROLE_CHOICES = [
         ('user', 'User'),
@@ -358,21 +455,34 @@ class ChatMessage(models.Model):
         ('system', 'System'),
     ]
 
+    conversation = models.ForeignKey(
+        Conversation,
+        on_delete=models.CASCADE,
+        related_name='messages',
+        help_text="Conversation this message belongs to"
+    )
     role = models.CharField(
         max_length=20,
         choices=ROLE_CHOICES,
         default='user'
     )
     content = models.TextField(help_text="Message content")
-    # TODO: Add conversation/session field for grouping messages
-    # conversation_id = models.CharField(max_length=100, blank=True, null=True)
+    model = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,
+        help_text="Model that generated this message (for assistant messages)"
+    )
+    tokens_used = models.IntegerField(
+        blank=True,
+        null=True,
+        help_text="Total tokens used for this response"
+    )
     user = models.ForeignKey(
         User,
         on_delete=models.CASCADE,
-        null=False,
-        blank=False,
         related_name='chat_messages',
-        help_text="User who created this message"
+        help_text="User who owns this message"
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -382,9 +492,78 @@ class ChatMessage(models.Model):
         verbose_name = 'Chat Message'
         verbose_name_plural = 'Chat Messages'
         indexes = [
+            models.Index(fields=['conversation', 'created_at']),
             models.Index(fields=['user', '-created_at']),
         ]
 
     def __str__(self):
-        return f"Chat Message #{self.id} - {self.role}"
+        return f"Message #{self.id} - {self.role} in Conv #{self.conversation_id}"
+
+
+def chat_attachment_upload_path(instance, filename):
+    """Generate upload path for chat attachments: chat_attachments/<user_id>/<conversation_id>/<filename>"""
+    return f"chat_attachments/{instance.message.user_id}/{instance.message.conversation_id}/{filename}"
+
+
+class ChatMessageAttachment(models.Model):
+    """
+    Model for file attachments on chat messages.
+    Supports images, text files, PDFs, and other documents.
+    Files are converted to the appropriate format for the OpenRouter API
+    (e.g., base64 data URLs for images sent to vision models).
+    """
+    ATTACHMENT_TYPE_CHOICES = [
+        ('image', 'Image'),
+        ('text', 'Text File'),
+        ('pdf', 'PDF Document'),
+        ('other', 'Other'),
+    ]
+
+    message = models.ForeignKey(
+        ChatMessage,
+        on_delete=models.CASCADE,
+        related_name='attachments',
+        help_text="Message this attachment belongs to"
+    )
+    file = models.FileField(
+        upload_to=chat_attachment_upload_path,
+        help_text="Uploaded file"
+    )
+    original_filename = models.CharField(
+        max_length=255,
+        help_text="Original filename as uploaded by the user"
+    )
+    file_type = models.CharField(
+        max_length=20,
+        choices=ATTACHMENT_TYPE_CHOICES,
+        default='other',
+        help_text="Type of the attachment"
+    )
+    mime_type = models.CharField(
+        max_length=100,
+        blank=True,
+        default='',
+        help_text="MIME type of the file (e.g., image/png, text/plain)"
+    )
+    file_size = models.IntegerField(
+        default=0,
+        help_text="File size in bytes"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at']
+        verbose_name = 'Chat Message Attachment'
+        verbose_name_plural = 'Chat Message Attachments'
+
+    def __str__(self):
+        return f"Attachment '{self.original_filename}' on Message #{self.message_id}"
+
+    @property
+    def is_image(self):
+        return self.file_type == 'image'
+
+    @property
+    def is_text(self):
+        return self.file_type in ('text', 'pdf')
 

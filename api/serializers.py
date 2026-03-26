@@ -1,5 +1,8 @@
 from rest_framework import serializers
-from .models import ImageGeneration, VideoGeneration, MusicGeneration, ChatMessage
+from .models import (
+    ImageGeneration, VideoGeneration, MusicGeneration,
+    Conversation, ChatMessage, ChatMessageAttachment,
+)
 
 
 class ImageGenerationSerializer(serializers.ModelSerializer):
@@ -141,9 +144,7 @@ class MusicGenerationSerializer(serializers.ModelSerializer):
         instrumental = data.get('instrumental', False)
 
         if custom_mode:
-            # Custom Mode validation
             if instrumental:
-                # If instrumental is true: style and title are required
                 if not data.get('style'):
                     raise serializers.ValidationError({
                         'style': 'Style is required when custom_mode is true and instrumental is true.'
@@ -153,7 +154,6 @@ class MusicGenerationSerializer(serializers.ModelSerializer):
                         'title': 'Title is required when custom_mode is true and instrumental is true.'
                     })
             else:
-                # If instrumental is false: style, prompt, and title are required
                 if not data.get('style'):
                     raise serializers.ValidationError({
                         'style': 'Style is required when custom_mode is true and instrumental is false.'
@@ -167,13 +167,11 @@ class MusicGenerationSerializer(serializers.ModelSerializer):
                         'title': 'Title is required when custom_mode is true and instrumental is false.'
                     })
         else:
-            # Non-custom Mode: only prompt is required
             if not data.get('prompt'):
                 raise serializers.ValidationError({
                     'prompt': 'Prompt is required when custom_mode is false.'
                 })
 
-        # Validate numeric fields range
         for field_name in ['style_weight', 'weirdness_constraint', 'audio_weight']:
             value = data.get(field_name)
             if value is not None:
@@ -185,22 +183,147 @@ class MusicGenerationSerializer(serializers.ModelSerializer):
         return data
 
 
+class ChatMessageAttachmentSerializer(serializers.ModelSerializer):
+    """
+    Serializer for ChatMessageAttachment model.
+    """
+    url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ChatMessageAttachment
+        fields = [
+            'id',
+            'message',
+            'file',
+            'original_filename',
+            'file_type',
+            'mime_type',
+            'file_size',
+            'url',
+            'created_at',
+        ]
+        read_only_fields = [
+            'id',
+            'file_type',
+            'mime_type',
+            'file_size',
+            'url',
+            'created_at',
+        ]
+
+    def get_url(self, obj):
+        request = self.context.get('request')
+        if obj.file and request:
+            return request.build_absolute_uri(obj.file.url)
+        elif obj.file:
+            return obj.file.url
+        return None
+
+
 class ChatMessageSerializer(serializers.ModelSerializer):
     """
     Serializer for ChatMessage model.
+    Includes nested attachments.
     """
+    attachments = ChatMessageAttachmentSerializer(many=True, read_only=True)
+
     class Meta:
         model = ChatMessage
         fields = [
             'id',
+            'conversation',
             'role',
             'content',
+            'model',
+            'tokens_used',
+            'attachments',
             'created_at',
             'updated_at',
         ]
         read_only_fields = [
             'id',
+            'model',
+            'tokens_used',
+            'attachments',
             'created_at',
             'updated_at',
         ]
 
+
+class ConversationSerializer(serializers.ModelSerializer):
+    """
+    Serializer for Conversation model.
+    """
+    message_count = serializers.SerializerMethodField()
+    last_message = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Conversation
+        fields = [
+            'id',
+            'title',
+            'model',
+            'system_prompt',
+            'temperature',
+            'max_tokens',
+            'is_archived',
+            'message_count',
+            'last_message',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = [
+            'id',
+            'message_count',
+            'last_message',
+            'created_at',
+            'updated_at',
+        ]
+
+    def get_message_count(self, obj):
+        return obj.messages.count()
+
+    def get_last_message(self, obj):
+        last = obj.messages.order_by('-created_at').first()
+        if last:
+            return {
+                'id': last.id,
+                'role': last.role,
+                'content': last.content[:100] + ('...' if len(last.content) > 100 else ''),
+                'created_at': last.created_at.isoformat(),
+            }
+        return None
+
+    def validate_model(self, value):
+        from .services.openrouter_api import OpenRouterService
+        if not OpenRouterService.is_valid_model(value):
+            raise serializers.ValidationError(
+                f"Unknown model '{value}'. Use GET /api/chat/models/ to see available models."
+            )
+        return value
+
+    def validate_temperature(self, value):
+        if value < 0.0 or value > 2.0:
+            raise serializers.ValidationError("Temperature must be between 0.0 and 2.0.")
+        return value
+
+    def validate_max_tokens(self, value):
+        if value < 1 or value > 128000:
+            raise serializers.ValidationError("max_tokens must be between 1 and 128000.")
+        return value
+
+
+class SendMessageSerializer(serializers.Serializer):
+    """
+    Serializer for sending a message to a conversation.
+    Used for POST /api/chat/conversations/{id}/send_message/
+
+    Supports multipart/form-data for file uploads.
+    Files are sent as 'files' field (multiple files allowed).
+    """
+    content = serializers.CharField(required=True, help_text="Message content")
+    files = serializers.ListField(
+        child=serializers.FileField(),
+        required=False,
+        help_text="Optional list of file attachments (images, text files, PDFs, etc.)"
+    )
