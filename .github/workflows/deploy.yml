@@ -3,9 +3,6 @@ on:
   push:
     branches:
       - production
-    paths:
-      - 'backend/**'
-
 jobs:
   build-and-deploy:
     runs-on: self-hosted
