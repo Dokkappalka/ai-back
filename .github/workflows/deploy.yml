@@ -1,0 +1,96 @@
+name: Deploy Backend
+
+on:
+  push:
+    branches:
+      - main
+      - production
+    paths:
+      - 'backend/**'
+  pull_request:
+    branches:
+      - main
+      - production
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        if: github.ref == 'refs/heads/production'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push backend image
+        if: github.ref == 'refs/heads/production'
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/ai-hype-backend:${{ github.sha }}
+          cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/ai-hype-backend:buildcache
+          cache-to: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/ai-hype-backend:buildcache,mode=max
+
+      - name: Build and push latest tag
+        if: github.ref == 'refs/heads/production'
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/ai-hype-backend:latest
+
+      - name: Deploy to server
+        if: github.ref == 'refs/heads/production'
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            cd /opt/ai-hype
+            echo "${{ github.sha }}" > backend_version.txt
+            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/ai-hype-backend:${{ github.sha }}
+            docker-compose pull backend
+            docker-compose up -d backend
+            docker image prune -f
+
+      - name: Run migrations
+        if: github.ref == 'refs/heads/production'
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            docker exec ai-hype-backend-1 python manage.py migrate --noinput || true
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          pip install flake8
+          cd backend
+          pip install -r requirements.txt
+
+      - name: Run flake8
+        run: |
+          flake8 backend --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 backend --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
