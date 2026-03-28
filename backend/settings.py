@@ -158,6 +158,7 @@ CORS_ALLOWED_ORIGINS = [
 CSRF_TRUSTED_ORIGINS = [
     "https://unsubordinative-nonbeatifically-macie.ngrok-free.dev",
     "https://api.sunoapi.org",
+    "https://music-assistant.mooo.com",
 ]
 
 CORS_ALLOW_CREDENTIALS = True
