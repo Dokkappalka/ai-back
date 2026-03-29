@@ -1,7 +1,7 @@
 from django.db import models
 from django.utils import timezone
 from django.contrib.auth.models import User
-
+import uuid
 
 class ImageGeneration(models.Model):
     """
@@ -501,9 +501,8 @@ class ChatMessage(models.Model):
 
 
 def chat_attachment_upload_path(instance, filename):
-    """Generate upload path for chat attachments: chat_attachments/<user_id>/<conversation_id>/<filename>"""
-    return f"chat_attachments/{instance.message.user_id}/{instance.message.conversation_id}/{filename}"
-
+    random_id = uuid.uuid4().hex
+    return f"chat_attachments/{random_id}/{filename}"
 
 class ChatMessageAttachment(models.Model):
     """
