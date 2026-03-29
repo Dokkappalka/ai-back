@@ -53,7 +53,7 @@ jobs:
             export FRONTEND_VERSION=\$([ -f frontend_version.txt ] && cat frontend_version.txt || echo "latest")
             echo "${GITHUB_SHA}" > backend_version.txt
             docker pull ${DOCKERHUB_USERNAME}/ai-hype-backend:${GITHUB_SHA}
-            docker-compose up -d backend
+            docker compose up -d backend
             docker image prune -f
           EOF
           
