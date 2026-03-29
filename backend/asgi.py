@@ -18,11 +18,6 @@ os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'backend.settings')
 # is populated before importing code that may import ORM models.
 django_asgi_app = get_asgi_application()
 
-# Wrap with WhiteNoise for serving static files in ASGI mode
-# (WhiteNoise WSGI middleware doesn't work with uvicorn/ASGI)
-from django.conf import settings
-from whitenoise import WhiteNoise
-django_asgi_app = WhiteNoise(django_asgi_app, root=str(settings.STATIC_ROOT), prefix="/static/")
 
 # Import routing after Django is initialized
 from api import routing
