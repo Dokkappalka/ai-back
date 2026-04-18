@@ -500,6 +500,106 @@ class ChatMessage(models.Model):
         return f"Message #{self.id} - {self.role} in Conv #{self.conversation_id}"
 
 
+class Project(models.Model):
+    TYPE_CHOICES = [
+        ('single', 'Single'),
+        ('album', 'Album'),
+    ]
+    STATUS_CHOICES = [
+        ('draft', 'Draft'),
+        ('generating', 'Generating'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
+    ]
+
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='projects',
+    )
+    title = models.CharField(max_length=255, default='Новый проект')
+    type = models.CharField(max_length=10, choices=TYPE_CHOICES, default='single')
+    track_count = models.IntegerField(default=1)
+    concept = models.TextField(blank=True, null=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = 'Project'
+        verbose_name_plural = 'Projects'
+        indexes = [
+            models.Index(fields=['user', '-created_at']),
+        ]
+
+    def __str__(self):
+        return f"Project #{self.id} - {self.title} ({self.status})"
+
+
+class ProjectTrack(models.Model):
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('generating', 'Generating'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
+    ]
+
+    project = models.ForeignKey(
+        Project,
+        on_delete=models.CASCADE,
+        related_name='tracks',
+    )
+    order = models.IntegerField(default=1)
+    title = models.CharField(max_length=255, blank=True, null=True)
+    suno_prompt = models.TextField(blank=True, null=True)
+    suno_style = models.CharField(max_length=1000, blank=True, null=True)
+    suno_model = models.CharField(max_length=20, default='V5')
+    suno_instrumental = models.BooleanField(default=False)
+    suno_negative_tags = models.CharField(max_length=500, blank=True, null=True)
+    music_generation = models.ForeignKey(
+        MusicGeneration,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='project_tracks',
+    )
+    selected_song = models.IntegerField(null=True, blank=True)  # 1 or 2
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+
+    class Meta:
+        ordering = ['order']
+        verbose_name = 'Project Track'
+        verbose_name_plural = 'Project Tracks'
+
+    def __str__(self):
+        return f"Track #{self.order} of Project #{self.project_id} - {self.title or 'Untitled'}"
+
+
+class ProjectChatMessage(models.Model):
+    ROLE_CHOICES = [
+        ('user', 'User'),
+        ('assistant', 'Assistant'),
+    ]
+
+    project = models.ForeignKey(
+        Project,
+        on_delete=models.CASCADE,
+        related_name='chat_messages',
+    )
+    role = models.CharField(max_length=10, choices=ROLE_CHOICES)
+    content = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at']
+        verbose_name = 'Project Chat Message'
+        verbose_name_plural = 'Project Chat Messages'
+
+    def __str__(self):
+        return f"Message #{self.id} ({self.role}) in Project #{self.project_id}"
+
+
 def chat_attachment_upload_path(instance, filename):
     random_id = uuid.uuid4().hex
     return f"chat_attachments/{random_id}/{filename}"

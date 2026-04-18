@@ -414,6 +414,42 @@ class MusicGenerationCallbackView(APIView):
                         }
                     )
                     logger.info(f"Sent WebSocket update to group {group_name} for task {task_id}")
+
+                    # Also notify project WebSocket if this music_generation belongs to a project track
+                    from .models import ProjectTrack
+                    from .serializers import ProjectTrackSerializer
+                    project_tracks = ProjectTrack.objects.filter(
+                        music_generation=instance
+                    ).select_related('project')
+                    for pt in project_tracks:
+                        new_status = 'completed' if instance.status == 'completed' else (
+                            'failed' if instance.status == 'failed' else 'generating'
+                        )
+                        pt.status = new_status
+                        pt.save(update_fields=['status'])
+
+                        # Update project status
+                        project = pt.project
+                        all_tracks = list(project.tracks.all())
+                        if all(t.status == 'completed' for t in all_tracks):
+                            project.status = 'completed'
+                            project.save(update_fields=['status'])
+                        elif any(t.status == 'failed' for t in all_tracks):
+                            project.status = 'failed'
+                            project.save(update_fields=['status'])
+
+                        track_data = ProjectTrackSerializer(pt).data
+                        async_to_sync(channel_layer.group_send)(
+                            f'project_{project.id}',
+                            {
+                                'type': 'project_track_update',
+                                'data': {
+                                    'track': track_data,
+                                    'project_status': project.status,
+                                    'music_generation': serializer.data,
+                                }
+                            }
+                        )
                 else:
                     logger.warning("Channel layer not available, skipping WebSocket update")
             except Exception as ws_error:
@@ -945,6 +981,303 @@ class ConversationViewSet(viewsets.ModelViewSet):
         conversation.is_archived = False
         conversation.save()
         return Response(ConversationSerializer(conversation).data)
+
+
+class ProjectViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for AI Producer projects.
+
+    Endpoints:
+    - GET    /api/projects/               - List user's projects
+    - POST   /api/projects/               - Create new project
+    - GET    /api/projects/{id}/          - Get project with tracks & chat
+    - PATCH  /api/projects/{id}/          - Update project (title, type, track_count, concept)
+    - DELETE /api/projects/{id}/          - Delete project
+    - POST   /api/projects/{id}/generate/ - Trigger music generation for all tracks
+    - GET    /api/projects/{id}/export/   - Download ZIP archive
+    - PATCH  /api/projects/{id}/tracks/{track_id}/ - Update a single track's params
+    - POST   /api/projects/{id}/tracks/{track_id}/select_song/ - Select song variant (1 or 2)
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get_serializer_class(self):
+        from .serializers import ProjectSerializer, ProjectListSerializer
+        if self.action == 'list':
+            return ProjectListSerializer
+        return ProjectSerializer
+
+    def get_queryset(self):
+        from .models import Project
+        return Project.objects.filter(user=self.request.user).prefetch_related('tracks', 'chat_messages')
+
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
+
+    def create(self, request, *args, **kwargs):
+        from .serializers import ProjectSerializer
+        serializer = ProjectSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        project = serializer.save(user=request.user)
+
+        # Pre-create track slots
+        from .models import ProjectTrack
+        track_count = project.track_count
+        for i in range(1, track_count + 1):
+            ProjectTrack.objects.get_or_create(project=project, order=i)
+
+        return Response(ProjectSerializer(project).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['patch'], url_path='tracks/(?P<track_id>[0-9]+)')
+    def update_track(self, request, pk=None, track_id=None):
+        """PATCH /api/projects/{id}/tracks/{track_id}/ — update track params."""
+        from .models import ProjectTrack
+        from .serializers import ProjectTrackSerializer
+        try:
+            track = ProjectTrack.objects.get(id=track_id, project_id=pk, project__user=request.user)
+        except ProjectTrack.DoesNotExist:
+            return Response({'error': 'Track not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = ProjectTrackSerializer(track, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'], url_path='tracks/(?P<track_id>[0-9]+)/select_song')
+    def select_song(self, request, pk=None, track_id=None):
+        """POST /api/projects/{id}/tracks/{track_id}/select_song/ — choose variant 1 or 2."""
+        from .models import ProjectTrack
+        from .serializers import ProjectTrackSerializer
+        try:
+            track = ProjectTrack.objects.get(id=track_id, project_id=pk, project__user=request.user)
+        except ProjectTrack.DoesNotExist:
+            return Response({'error': 'Track not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        song_num = request.data.get('song')
+        if song_num not in (1, 2):
+            return Response({'error': 'song must be 1 or 2'}, status=status.HTTP_400_BAD_REQUEST)
+        track.selected_song = song_num
+        track.save(update_fields=['selected_song'])
+        return Response(ProjectTrackSerializer(track).data)
+
+    @action(detail=True, methods=['post'], url_path='tracks/(?P<track_id>[0-9]+)/regenerate')
+    def regenerate_track(self, request, pk=None, track_id=None):
+        """POST /api/projects/{id}/tracks/{track_id}/regenerate/ — перегенерировать один трек."""
+        from .models import ProjectTrack, MusicGeneration
+        from .serializers import ProjectTrackSerializer, ProjectSerializer
+        try:
+            track = ProjectTrack.objects.get(id=track_id, project_id=pk, project__user=request.user)
+        except ProjectTrack.DoesNotExist:
+            return Response({'error': 'Track not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        project = track.project
+        suno_service = SunoAPIService()
+        callback_url = f"{settings.BASE_URL}/api/music/callback/"
+
+        # Сброс статуса перед перегенерацией
+        track.status = 'pending'
+        track.music_generation = None
+        track.save(update_fields=['status', 'music_generation'])
+
+        suno_params = {
+            'custom_mode': True,
+            'instrumental': track.suno_instrumental,
+            'model': track.suno_model or 'V5',
+            'callback_url': callback_url,
+        }
+        if track.suno_style:
+            suno_params['style'] = track.suno_style
+        if track.title:
+            suno_params['title'] = track.title
+        if not track.suno_instrumental and track.suno_prompt:
+            suno_params['prompt'] = track.suno_prompt
+        if track.suno_negative_tags:
+            suno_params['negative_tags'] = track.suno_negative_tags
+
+        try:
+            response = suno_service.generate_music(**suno_params)
+            if response.get('code') == 200 and response.get('data', {}).get('taskId'):
+                music_gen = MusicGeneration.objects.create(
+                    user=request.user,
+                    custom_mode=True,
+                    instrumental=track.suno_instrumental,
+                    model=track.suno_model or 'V5',
+                    style=track.suno_style or '',
+                    title=track.title or f'Track {track.order}',
+                    prompt=track.suno_prompt or '',
+                    negative_tags=track.suno_negative_tags or '',
+                    task_id=response['data']['taskId'],
+                    status='processing',
+                )
+                track.music_generation = music_gen
+                track.status = 'generating'
+                track.save(update_fields=['music_generation', 'status'])
+                project.status = 'generating'
+                project.save(update_fields=['status'])
+                return Response({'status': 'generation_started', 'track': ProjectTrackSerializer(track).data})
+            else:
+                error_msg = response.get('msg', 'Unknown error from Suno API')
+                track.status = 'failed'
+                track.save(update_fields=['status'])
+                return Response({'error': error_msg}, status=status.HTTP_502_BAD_GATEWAY)
+        except Exception as e:
+            logger.error(f"Suno regeneration error for track {track.id}: {e}", exc_info=True)
+            track.status = 'failed'
+            track.save(update_fields=['status'])
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=True, methods=['post'])
+    def generate(self, request, pk=None):
+        """
+        POST /api/projects/{id}/generate/
+        Trigger parallel Suno generation for all tracks that have params set.
+        """
+        from .models import Project, ProjectTrack
+        from .serializers import ProjectSerializer
+        try:
+            project = Project.objects.get(id=pk, user=request.user)
+        except Project.DoesNotExist:
+            return Response({'error': 'Project not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        tracks = list(project.tracks.all())
+        if not tracks:
+            return Response({'error': 'No tracks to generate'}, status=status.HTTP_400_BAD_REQUEST)
+
+        from .models import MusicGeneration
+        suno_service = SunoAPIService()
+        callback_url = f"{settings.BASE_URL}/api/music/callback/"
+        errors = []
+        started = 0
+
+        # Если проект уже завершён — сбрасываем все треки для перегенерации
+        force = request.data.get('force', False)
+        if force or project.status == 'completed':
+            for track in tracks:
+                track.status = 'pending'
+                track.music_generation = None
+                track.save(update_fields=['status', 'music_generation'])
+            project.status = 'pending'
+            project.save(update_fields=['status'])
+
+        for track in tracks:
+            if track.status == 'completed':
+                continue
+
+            suno_params = {
+                'custom_mode': True,
+                'instrumental': track.suno_instrumental,
+                'model': track.suno_model or 'V5',
+                'callback_url': callback_url,
+            }
+            if track.suno_style:
+                suno_params['style'] = track.suno_style
+            if track.title:
+                suno_params['title'] = track.title
+            if not track.suno_instrumental and track.suno_prompt:
+                suno_params['prompt'] = track.suno_prompt
+            if track.suno_negative_tags:
+                suno_params['negative_tags'] = track.suno_negative_tags
+
+            try:
+                response = suno_service.generate_music(**suno_params)
+                if response.get('code') == 200 and response.get('data', {}).get('taskId'):
+                    music_gen = MusicGeneration.objects.create(
+                        user=request.user,
+                        custom_mode=True,
+                        instrumental=track.suno_instrumental,
+                        model=track.suno_model or 'V5',
+                        style=track.suno_style or '',
+                        title=track.title or f'Track {track.order}',
+                        prompt=track.suno_prompt or '',
+                        negative_tags=track.suno_negative_tags or '',
+                        task_id=response['data']['taskId'],
+                        status='processing',
+                    )
+                    track.music_generation = music_gen
+                    track.status = 'generating'
+                    track.save(update_fields=['music_generation', 'status'])
+                    started += 1
+                else:
+                    error_msg = response.get('msg', 'Unknown error from Suno API')
+                    logger.error(f"Suno rejected track {track.id}: code={response.get('code')}, msg={error_msg}")
+                    track.status = 'failed'
+                    track.save(update_fields=['status'])
+                    errors.append({'track_order': track.order, 'error': error_msg})
+
+            except Exception as e:
+                logger.error(f"Suno generation error for track {track.id}: {e}", exc_info=True)
+                track.status = 'failed'
+                track.save(update_fields=['status'])
+                errors.append({'track_order': track.order, 'error': str(e)})
+
+        if started > 0:
+            project.status = 'generating'
+        elif errors:
+            project.status = 'failed'
+        project.save(update_fields=['status'])
+
+        return Response({
+            'status': 'generation_started',
+            'errors': errors,
+            'project': ProjectSerializer(project).data,
+        })
+
+    @action(detail=True, methods=['get'])
+    def export(self, request, pk=None):
+        """GET /api/projects/{id}/export/ — download ZIP with mp3, covers, tracklist."""
+        import io
+        import zipfile
+        import requests as req_lib
+        from django.http import HttpResponse
+        from .models import Project
+
+        try:
+            project = Project.objects.get(id=pk, user=request.user)
+        except Project.DoesNotExist:
+            return Response({'error': 'Project not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        tracks = list(project.tracks.filter(status='completed').select_related('music_generation').order_by('order'))
+        if not tracks:
+            return Response({'error': 'No completed tracks to export'}, status=status.HTTP_400_BAD_REQUEST)
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+            tracklist_lines = [f"Проект: {project.title}", f"Концепция: {project.concept or '—'}", ""]
+            for track in tracks:
+                mg = track.music_generation
+                if not mg:
+                    continue
+
+                song_num = track.selected_song or 1
+                audio_url = getattr(mg, f'song_{song_num}_url', None) or getattr(mg, f'song_{song_num}_stream_url', None)
+                image_url = getattr(mg, f'song_{song_num}_image_url', None)
+                track_title = track.title or f'Track {track.order}'
+                prefix = f"{track.order:02d} - {track_title}"
+
+                tracklist_lines.append(f"{prefix}")
+
+                if audio_url:
+                    try:
+                        r = req_lib.get(audio_url, timeout=60)
+                        if r.status_code == 200:
+                            zf.writestr(f"{prefix}.mp3", r.content)
+                    except Exception as e:
+                        logger.warning(f"Failed to download audio for track {track.id}: {e}")
+
+                if image_url:
+                    try:
+                        r = req_lib.get(image_url, timeout=30)
+                        if r.status_code == 200:
+                            zf.writestr(f"{prefix} cover.jpg", r.content)
+                    except Exception as e:
+                        logger.warning(f"Failed to download image for track {track.id}: {e}")
+
+            zf.writestr("tracklist.txt", "\n".join(tracklist_lines))
+
+        buf.seek(0)
+        safe_title = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in project.title)
+        response = HttpResponse(buf.read(), content_type='application/zip')
+        response['Content-Disposition'] = f'attachment; filename="{safe_title}.zip"'
+        return response
 
 
 class AvailableModelsView(APIView):

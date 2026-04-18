@@ -2,6 +2,7 @@ from rest_framework import serializers
 from .models import (
     ImageGeneration, VideoGeneration, MusicGeneration,
     Conversation, ChatMessage, ChatMessageAttachment,
+    Project, ProjectTrack, ProjectChatMessage,
 )
 
 
@@ -311,6 +312,62 @@ class ConversationSerializer(serializers.ModelSerializer):
         if value < 1 or value > 128000:
             raise serializers.ValidationError("max_tokens must be between 1 and 128000.")
         return value
+
+
+class ProjectChatMessageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProjectChatMessage
+        fields = ['id', 'project', 'role', 'content', 'created_at']
+        read_only_fields = ['id', 'created_at']
+
+
+class ProjectTrackSerializer(serializers.ModelSerializer):
+    music_generation_data = MusicGenerationSerializer(source='music_generation', read_only=True)
+
+    class Meta:
+        model = ProjectTrack
+        fields = [
+            'id', 'project', 'order', 'title',
+            'suno_prompt', 'suno_style', 'suno_model',
+            'suno_instrumental', 'suno_negative_tags',
+            'music_generation', 'music_generation_data',
+            'selected_song', 'status',
+        ]
+        read_only_fields = ['id', 'project', 'music_generation_data']
+
+
+class ProjectSerializer(serializers.ModelSerializer):
+    tracks = ProjectTrackSerializer(many=True, read_only=True)
+    chat_messages = ProjectChatMessageSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Project
+        fields = [
+            'id', 'user', 'title', 'type', 'track_count',
+            'concept', 'status', 'tracks', 'chat_messages',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'user', 'status', 'tracks', 'chat_messages', 'created_at', 'updated_at']
+
+
+class ProjectListSerializer(serializers.ModelSerializer):
+    """Lightweight serializer for project list (no tracks/messages)."""
+    track_count_completed = serializers.SerializerMethodField()
+    track_count_with_audio = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Project
+        fields = [
+            'id', 'title', 'type', 'track_count',
+            'track_count_completed', 'track_count_with_audio', 'concept', 'status',
+            'created_at', 'updated_at',
+        ]
+
+    def get_track_count_completed(self, obj):
+        return obj.tracks.filter(status='completed').count()
+
+    def get_track_count_with_audio(self, obj):
+        return obj.tracks.filter(status='completed', music_generation__isnull=False).count()
 
 
 class SendMessageSerializer(serializers.Serializer):

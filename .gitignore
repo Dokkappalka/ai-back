@@ -2,3 +2,5 @@
 media/
 __pycache__/
 *.pyc
+api/__pycache__
+*__pycache__/

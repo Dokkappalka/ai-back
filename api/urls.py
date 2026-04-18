@@ -7,6 +7,7 @@ from .views import (
     ConversationViewSet,
     MusicGenerationCallbackView,
     AvailableModelsView,
+    ProjectViewSet,
 )
 
 # Create a router and register our viewsets
@@ -15,6 +16,7 @@ router.register(r'image', ImageGenerationViewSet, basename='image')
 router.register(r'video', VideoGenerationViewSet, basename='video')
 router.register(r'music', MusicGenerationViewSet, basename='music')
 router.register(r'chat/conversations', ConversationViewSet, basename='conversation')
+router.register(r'projects', ProjectViewSet, basename='project')
 
 urlpatterns = [
     # Callback endpoint for Suno API (must be outside router as it's not a ViewSet)
