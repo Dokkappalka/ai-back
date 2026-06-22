@@ -30,7 +30,7 @@ DEFAULT_MODEL = 'openai/gpt-4o-mini'
 
 class OpenRouterService:
     """
-    Service class for interacting with OpenRouter API for chat completions.
+    Service class for interacting with OpenRouter API for chat completions. Мега пенис, я просто инициирую docker Actions.
     """
     BASE_URL = "https://openrouter.ai/api/v1"
     MODELS_CACHE_KEY = "openrouter_all_models_data"
