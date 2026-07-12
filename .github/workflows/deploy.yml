@@ -39,14 +39,14 @@ jobs:
           mkdir -p ~/.ssh
           echo "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+          ssh-keyscan -H 89.22.231.14 >> ~/.ssh/known_hosts
           
       - name: Deploy to server
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           GITHUB_SHA: ${{ github.sha }}
         run: |
-          ssh -i ~/.ssh/deploy_key ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << EOF
+          ssh -i ~/.ssh/deploy_key ${{ secrets.SERVER_USER }}@89.22.231.14 << EOF
             cd /opt/ai-hype
             export DOCKERHUB_USERNAME="${DOCKERHUB_USERNAME}"
             export BACKEND_VERSION="${GITHUB_SHA}"
@@ -59,7 +59,7 @@ jobs:
           
       - name: Run migrations
         run: |
-          ssh -i ~/.ssh/deploy_key ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
+          ssh -i ~/.ssh/deploy_key ${{ secrets.SERVER_USER }}@89.22.231.14 << 'EOF'
             docker exec ai-hype-backend-1 python manage.py migrate --noinput || true
           EOF
           
