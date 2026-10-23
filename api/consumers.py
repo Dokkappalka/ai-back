@@ -14,7 +14,27 @@ from django.conf import settings
 
 logger = logging.getLogger(__name__)
 
-PROJECT_AI_MODEL = 'anthropic/claude-sonnet-4'
+# Fallback used only when the admin panel has no active AIModel configured.
+# The real model is resolved per-request from the AIModel table (see _get_project_ai_model)
+# so a dead/renamed model can be swapped in Django Admin without a redeploy.
+PROJECT_AI_FALLBACK_MODEL = 'openai/gpt-4o-mini'
+
+
+@database_sync_to_async
+def _get_project_ai_model():
+    """Resolve the AI producer model: default active AIModel, else first active, else fallback."""
+    from .models import AIModel
+
+    model = (
+        AIModel.objects.filter(is_active=True, is_default=True).first()
+        or AIModel.objects.filter(is_active=True).order_by('order', 'model_id').first()
+    )
+    if model:
+        return model.model_id
+    logger.warning(
+        "No active AIModel configured; falling back to %s", PROJECT_AI_FALLBACK_MODEL
+    )
+    return PROJECT_AI_FALLBACK_MODEL
 
 PROJECT_SYSTEM_PROMPT = """Ты — AI-продюсер музыкального проекта. Помогаешь пользователю создать музыку через Suno AI.
 
@@ -303,10 +323,11 @@ class ProjectConsumer(AsyncWebsocketConsumer):
         messages += history
 
         full_response = ''
+        ai_model = await _get_project_ai_model()
         try:
             from .services.openrouter_api import OpenRouterService
             service = OpenRouterService()
-            async for chunk in service.chat_completion_stream_async(messages, model=PROJECT_AI_MODEL, temperature=0.7, max_tokens=4096):
+            async for chunk in service.chat_completion_stream_async(messages, model=ai_model, temperature=0.7, max_tokens=4096):
                 if chunk['type'] == 'chunk':
                     full_response += chunk['content']
                     await self.send(json.dumps({
@@ -316,11 +337,14 @@ class ProjectConsumer(AsyncWebsocketConsumer):
                 elif chunk['type'] == 'done':
                     break
                 elif chunk['type'] == 'error':
-                    await self.send(json.dumps({'type': 'error', 'message': chunk.get('message', 'AI error')}))
+                    # OpenRouterService puts the error text in 'content', not 'message'.
+                    error_text = chunk.get('content') or chunk.get('message') or 'AI error'
+                    logger.error("AI producer error (model=%s): %s", ai_model, error_text)
+                    await self.send(json.dumps({'type': 'error', 'message': error_text}))
                     return
         except Exception as e:
             logger.error(f"OpenRouter stream error in ProjectConsumer: {e}", exc_info=True)
-            await self.send(json.dumps({'type': 'error', 'message': 'Ошибка AI-сервиса'}))
+            await self.send(json.dumps({'type': 'error', 'message': f'Ошибка AI-сервиса: {e}'}))
             return
 
         # Try to extract JSON tracks data
